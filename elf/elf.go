@@ -348,6 +348,103 @@ func (b *Module) relocate(data []byte, rdata []byte) error {
 	}
 }
 
+func (b *Module) loadProg(processed []bool, lp unsafe.Pointer, version uint32) error {
+	for i, section := range b.file.Sections {
+		if processed[i] {
+			continue
+		}
+
+		data, err := section.Data()
+		if err != nil {
+			return err
+		}
+
+		if len(data) == 0 {
+			continue
+		}
+
+		relocate := section.Type == elf.SHT_REL
+
+		secName := section.Name
+		size := section.Size
+		if relocate {
+			rsection := b.file.Sections[section.Info]
+			processed[section.Info] = true
+			secName = rsection.Name
+			size = rsection.Size
+			data, err = rsection.Data()
+			if err != nil {
+				return err
+			}
+		}
+
+		processed[i] = true
+
+		isKprobe := strings.HasPrefix(secName, "kprobe/")
+		isKretprobe := strings.HasPrefix(secName, "kretprobe/")
+		isCgroupSkb := strings.HasPrefix(secName, "cgroup/skb")
+		isCgroupSock := strings.HasPrefix(secName, "cgroup/sock")
+
+		var progType uint32
+		switch {
+		case isKprobe:
+			fallthrough
+		case isKretprobe:
+			progType = uint32(C.BPF_PROG_TYPE_KPROBE)
+		case isCgroupSkb:
+			// BPF_PROG_TYPE_CGROUP_SKB
+			progType = 8
+		case isCgroupSock:
+			// BPF_PROG_TYPE_CGROUP_SOCK
+			progType = 9
+		}
+
+		if isKprobe || isKretprobe || isCgroupSkb || isCgroupSock {
+			if relocate {
+				if len(data) == 0 {
+					continue
+				}
+
+				err = b.relocate(data, data)
+				if err != nil {
+					return err
+				}
+			}
+
+			insns := (*C.struct_bpf_insn)(unsafe.Pointer(&data[0]))
+
+			progFd := C.bpf_prog_load(progType,
+				insns, C.int(size),
+				(*C.char)(lp), C.int(version),
+				(*C.char)(unsafe.Pointer(&b.log[0])), C.int(len(b.log)))
+			if progFd < 0 {
+				return fmt.Errorf("error while loading %q:\n%s", secName, b.log)
+			}
+
+			switch {
+			case isKprobe:
+				fallthrough
+			case isKretprobe:
+				b.probes[secName] = &Kprobe{
+					Name:  secName,
+					insns: insns,
+					fd:    int(progFd),
+				}
+			case isCgroupSkb:
+				fallthrough
+			case isCgroupSock:
+				b.cgroup[secName] = &CgroupBPF{
+					Name:  secName,
+					insns: insns,
+					Fd:    int(progFd),
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
 func (b *Module) Load() error {
 	fileReader, err := os.Open(b.fileName)
 	if err != nil {
@@ -386,159 +483,13 @@ func (b *Module) Load() error {
 	b.maps = maps
 
 	processed := make([]bool, len(b.file.Sections))
-	for i, section := range b.file.Sections {
-		if processed[i] {
-			continue
-		}
 
-		data, err := section.Data()
-		if err != nil {
-			return err
-		}
-
-		if len(data) == 0 {
-			continue
-		}
-
-		if section.Type == elf.SHT_REL {
-			rsection := b.file.Sections[section.Info]
-
-			processed[i] = true
-			processed[section.Info] = true
-
-			secName := rsection.Name
-
-			isKprobe := strings.HasPrefix(secName, "kprobe/")
-			isKretprobe := strings.HasPrefix(secName, "kretprobe/")
-			isCgroupSkb := strings.HasPrefix(secName, "cgroup/skb")
-			isCgroupSock := strings.HasPrefix(secName, "cgroup/sock")
-
-			var progType uint32
-			switch {
-			case isKprobe:
-				fallthrough
-			case isKretprobe:
-				progType = uint32(C.BPF_PROG_TYPE_KPROBE)
-			case isCgroupSkb:
-				// BPF_PROG_TYPE_CGROUP_SKB
-				progType = 8
-			case isCgroupSock:
-				// BPF_PROG_TYPE_CGROUP_SOCK
-				progType = 9
-			}
-
-			if isKprobe || isKretprobe || isCgroupSkb || isCgroupSock {
-				rdata, err := rsection.Data()
-				if err != nil {
-					return err
-				}
-
-				if len(rdata) == 0 {
-					continue
-				}
-
-				err = b.relocate(data, rdata)
-				if err != nil {
-					return err
-				}
-
-				insns := (*C.struct_bpf_insn)(unsafe.Pointer(&rdata[0]))
-
-				progFd := C.bpf_prog_load(progType,
-					insns, C.int(rsection.Size),
-					(*C.char)(lp), C.int(version),
-					(*C.char)(unsafe.Pointer(&b.log[0])), C.int(len(b.log)))
-				if progFd < 0 {
-					return fmt.Errorf("error while loading %q:\n%s", secName, b.log)
-				}
-
-				switch {
-				case isKprobe:
-					fallthrough
-				case isKretprobe:
-					b.probes[secName] = &Kprobe{
-						Name:  secName,
-						insns: insns,
-						fd:    int(progFd),
-					}
-				case isCgroupSkb:
-					fallthrough
-				case isCgroupSock:
-					b.cgroup[secName] = &CgroupBPF{
-						Name:  secName,
-						insns: insns,
-						Fd:    int(progFd),
-					}
-				}
-			}
-		}
+	if err := b.loadProg(processed, lp, version); err != nil {
+		return err
 	}
 
-	for i, section := range b.file.Sections {
-		if processed[i] {
-			continue
-		}
-
-		secName := section.Name
-
-		isKprobe := strings.HasPrefix(secName, "kprobe/")
-		isKretprobe := strings.HasPrefix(secName, "kretprobe/")
-		isCgroupSkb := strings.HasPrefix(secName, "cgroup/skb")
-		isCgroupSock := strings.HasPrefix(secName, "cgroup/sock")
-
-		var progType uint32
-		switch {
-		case isKprobe:
-			fallthrough
-		case isKretprobe:
-			progType = uint32(C.BPF_PROG_TYPE_KPROBE)
-		case isCgroupSkb:
-			// BPF_PROG_TYPE_CGROUP_SKB
-			progType = 8
-		case isCgroupSock:
-			// BPF_PROG_TYPE_CGROUP_SOCK
-			progType = 9
-		}
-
-		if isKprobe || isKretprobe || isCgroupSkb || isCgroupSock {
-			data, err := section.Data()
-			if err != nil {
-				return err
-			}
-
-			if len(data) == 0 {
-				continue
-			}
-
-			insns := (*C.struct_bpf_insn)(unsafe.Pointer(&data[0]))
-
-			progFd := C.bpf_prog_load(progType,
-				insns, C.int(section.Size),
-				(*C.char)(lp), C.int(version),
-				(*C.char)(unsafe.Pointer(&b.log[0])), C.int(len(b.log)))
-			if progFd < 0 {
-				return fmt.Errorf("error while loading %q:\n%s", section.Name, b.log)
-			}
-
-			switch {
-			case isKprobe:
-				fallthrough
-			case isKretprobe:
-				b.probes[secName] = &Kprobe{
-					Name:  secName,
-					insns: insns,
-					fd:    int(progFd),
-				}
-			case isCgroupSkb:
-				fallthrough
-			case isCgroupSock:
-				b.cgroup[secName] = &CgroupBPF{
-					Name:  secName,
-					insns: insns,
-					Fd:    int(progFd),
-				}
-			}
-		}
+	if err := b.loadProg(processed, lp, version); err != nil {
+		return err
 	}
 
 	for name, _ := range b.maps {
