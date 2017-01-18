@@ -57,6 +57,7 @@ type Module struct {
 	log    []byte
 	maps   map[string]*Map
 	probes map[string]*Kprobe
+	cgroup map[string]*CgroupBPF
 }
 
 // Kprobe represents a kprobe or kretprobe and has to be declared
@@ -68,10 +69,18 @@ type Kprobe struct {
 	efd   int
 }
 
+type CgroupBPF struct {
+	Name  string
+	insns *C.struct_bpf_insn
+	Fd    int
+	efd   int
+}
+
 func NewModule(fileName string) *Module {
 	return &Module{
 		fileName: fileName,
 		probes:   make(map[string]*Kprobe),
+		cgroup:   make(map[string]*CgroupBPF),
 		log:      make([]byte, 65536),
 	}
 }
@@ -154,4 +163,19 @@ func (b *Module) EnableKprobes() error {
 		}
 	}
 	return nil
+}
+
+func (b *Module) IterCgroup() <-chan *CgroupBPF {
+	ch := make(chan *CgroupBPF)
+	go func() {
+		for name := range b.cgroup {
+			ch <- b.cgroup[name]
+		}
+		close(ch)
+	}()
+	return ch
+}
+
+func (b *Module) Cgroup(name string) *CgroupBPF {
+	return b.cgroup[name]
 }
